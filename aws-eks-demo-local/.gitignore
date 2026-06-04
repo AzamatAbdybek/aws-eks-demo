@@ -1,0 +1,35 @@
+# Terraform / Terragrunt generated files
+**/.terraform/
+**/.terragrunt-cache/
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/tfplan
+**/plan.tfplan
+**/crash.log
+**/override.tf
+**/override.tf.json
+
+# Generated pipeline files (created at CI runtime)
+.gitlab/generated-pipeline.gitlab-ci.yml
+
+# Environment / secret files — never commit these
+*.env
+.env
+*.tfvars
+!example.tfvars
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp

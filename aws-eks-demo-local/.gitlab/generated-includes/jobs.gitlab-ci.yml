@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable Terragrunt job anchors
+# Referenced via `extends:` in dynamically generated project jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Format ────────────────────────────────────────────────────────────────────
+
+.terragrunt:fmt:
+  stage: format
+  script:
+    - |
+      echo "=== Checking HCL formatting in $PROJECT_FOLDER ==="
+      cd "$PROJECT_FOLDER"
+      terragrunt hcl fmt --check --diff .
+  allow_failure: true  # Formatting issues are warnings, not pipeline blockers
+
+# ── Plan ──────────────────────────────────────────────────────────────────────
+
+.terragrunt:plan:
+  stage: plan
+  script:
+    - |
+      echo "=== Terragrunt plan: $PROJECT_FOLDER ==="
+      cd "$PROJECT_FOLDER"
+      terragrunt run-all init --terragrunt-non-interactive
+      terragrunt run-all plan --terragrunt-non-interactive
+  cache:
+    key: "tg-cache-${PROJECT_FOLDER}"
+    paths:
+      - "${PROJECT_FOLDER}/**/.terragrunt-cache/"
+      - "${PROJECT_FOLDER}/**/.terraform.lock.hcl"
+    policy: pull-push
+  artifacts:
+    paths:
+      - "${PROJECT_FOLDER}/**/plan.tfplan"
+    expire_in: 2 hours
+
+# ── Apply ─────────────────────────────────────────────────────────────────────
+
+.terragrunt:apply:
+  stage: apply
+  script:
+    - |
+      echo "=== Terragrunt apply: $PROJECT_FOLDER ==="
+      cd "$PROJECT_FOLDER"
+      terragrunt run-all apply --terragrunt-non-interactive -auto-approve
+  cache:
+    key: "tg-cache-${PROJECT_FOLDER}"
+    paths:
+      - "${PROJECT_FOLDER}/**/.terragrunt-cache/"
+    policy: pull
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+
+.terragrunt:outputs:
+  stage: outputs
+  script:
+    - |
+      echo "=== Collecting Terraform outputs for $PROJECT_FOLDER ==="
+      OUTPUT_FILE="terraform_outputs_$(basename $PROJECT_FOLDER).json"
+      cd "$PROJECT_FOLDER"
+      # Collect all module outputs into a single JSON file
+      terragrunt run-all output --json 2>/dev/null \
+        | python3 -c "
+      import sys, json
+      data = {}
+      for line in sys.stdin:
+          line = line.strip()
+          if line.startswith('{'):
+              try:
+                  data.update(json.loads(line))
+              except json.JSONDecodeError:
+                  pass
+      print(json.dumps(data, indent=2))
+      " > "$CI_PROJECT_DIR/$OUTPUT_FILE"
+      echo "Outputs written to $OUTPUT_FILE"
+  artifacts:
+    paths:
+      - "terraform_outputs_*.json"
+    expire_in: 7 days

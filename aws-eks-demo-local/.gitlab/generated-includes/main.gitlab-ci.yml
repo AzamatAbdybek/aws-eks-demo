@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Child pipeline configuration
+# Included automatically by all dynamically generated pipelines
+# ─────────────────────────────────────────────────────────────────────────────
+
+image: ${CI_IMAGE_TERRAGRUNT}
+
+stages:
+  - format
+  - plan
+  - apply
+  - outputs
+
+variables:
+  # AWS region — set in project.yaml; override here only if needed globally
+  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+
+  # Helm registry credentials (optional — only needed for private charts)
+  HELM_REPO_USERNAME: ${HELM_REPO_USERNAME}
+  HELM_REPO_PASSWORD: ${HELM_REPO_PASSWORD}
+
+  # Terragrunt / Terraform flags
+  TERRAGRUNT_NON_INTERACTIVE: "true"
+  TF_INPUT: "false"
+  TF_IN_AUTOMATION: "true"

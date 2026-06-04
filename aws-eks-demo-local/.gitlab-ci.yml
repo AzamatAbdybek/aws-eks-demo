@@ -1,0 +1,21 @@
+default:
+  tags:
+    - ${CI_RUNNER_TAG}
+  image: ${CI_IMAGE_TERRAGRUNT}
+
+stages:
+  - changes
+  - generate
+  - trigger
+  - check-variables
+  - init-project
+  # EKS Upgrade Automation stages (only active when EKS_UPGRADE=true or EKS_ROLLBACK=true)
+  - eks-discover
+  - eks-validate
+  - eks-create-mr
+  - eks-notify
+
+include:
+  - local: '.gitlab/deploy.gitlab-ci.yml'
+  - local: '.gitlab/provision.gitlab-ci.yml'
+  - local: '.gitlab/eks-upgrade.gitlab-ci.yml'

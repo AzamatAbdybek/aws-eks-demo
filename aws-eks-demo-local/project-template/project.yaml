@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# project.yaml — Project configuration template
+#
+# This file is rendered by the provision pipeline using `envsubst`.
+# Placeholders ($VARIABLE) are replaced with real values at provisioning time.
+# After rendering, it becomes a valid Terragrunt HCL file read by all
+# terragrunt.hcl files in this project via:
+#   read_terragrunt_config(find_in_parent_folders("project.yaml"))
+# ─────────────────────────────────────────────────────────────────────────────
+
+locals {
+  # ── Project Identity ────────────────────────────────────────────────────────
+  project_name   = "$PROJECT_NAME"           # e.g. aws-eks-prod1
+  ticket         = "${TICKET:-N/A}"          # linked Jira / task ID (optional)
+  team           = "${TEAM:-platform}"       # owning team
+
+  # ── AWS ─────────────────────────────────────────────────────────────────────
+  aws_account_id = "$AWS_ACCOUNT_ID"         # 12-digit AWS account ID
+  region         = "$REGION"                # e.g. us-east-1
+  environment    = "$ENVIRONMENT"           # dev | staging | prod
+
+  # ── Networking ──────────────────────────────────────────────────────────────
+  # Allocate a /24 per project — split into two private and two public /26 subnets
+  vpc_cidr        = "$VPC_CIDR"
+  private_subnets = ["${PRIVATE_SUBNET_1:-}", "${PRIVATE_SUBNET_2:-}"]
+  public_subnets  = ["${PUBLIC_SUBNET_1:-}", "${PUBLIC_SUBNET_2:-}"]
+
+  # ── EKS ─────────────────────────────────────────────────────────────────────
+  eks_version            = "${EKS_VERSION:-1.35}"
+  eks_node_instance_type = "${EKS_NODE_INSTANCE_TYPE:-m5.xlarge}"
+}

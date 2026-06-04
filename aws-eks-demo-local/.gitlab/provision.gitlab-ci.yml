@@ -1,0 +1,131 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Provision Pipeline
+#
+# Creates a new project from the project-template.
+# Trigger manually from the GitLab UI with the following CI/CD variables:
+#
+#   PROJECT_NAME     — unique identifier, e.g. aws-eks-prod1 (lowercase, no spaces)
+#   AWS_ACCOUNT_ID   — 12-digit AWS account ID
+#   REGION           — AWS region, e.g. us-east-1
+#   ENVIRONMENT      — dev | staging | prod
+#   VPC_CIDR         — CIDR block for the new VPC, e.g. 10.0.3.0/24
+#   TICKET           — (optional) linked ticket / task ID
+#   TEAM             — (optional) owning team name
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage: check-variables ────────────────────────────────────────────────────
+
+Provision Check Variables:
+  stage: check-variables
+  script:
+    - |
+      echo "=== Validating provisioning variables ==="
+      ERRORS=0
+
+      check_var() {
+        local name=$1
+        local value
+        value=$(eval echo "\$$name")
+        if [ -z "$value" ]; then
+          echo "  ERROR: $name is required but not set"
+          ERRORS=$((ERRORS + 1))
+        else
+          echo "  OK: $name = $value"
+        fi
+      }
+
+      check_var PROJECT_NAME
+      check_var AWS_ACCOUNT_ID
+      check_var REGION
+      check_var ENVIRONMENT
+      check_var VPC_CIDR
+
+      if [ "$ERRORS" -gt 0 ]; then
+        echo ""
+        echo "Provisioning aborted: $ERRORS required variable(s) missing."
+        exit 1
+      fi
+
+      # Normalise to lowercase
+      PROJECT_NAME=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]')
+      REGION=$(echo "$REGION"            | tr '[:upper:]' '[:lower:]')
+      ENVIRONMENT=$(echo "$ENVIRONMENT"  | tr '[:upper:]' '[:lower:]')
+
+      # Validate project name format (letters, digits, hyphens only)
+      if ! echo "$PROJECT_NAME" | grep -qE '^[a-z0-9][a-z0-9-]+[a-z0-9]$'; then
+        echo "ERROR: PROJECT_NAME must contain only lowercase letters, digits, and hyphens"
+        exit 1
+      fi
+
+      echo ""
+      echo "=== All variables valid ==="
+
+      # Write normalised values for downstream jobs
+      cat > provision.env <<EOF
+      PROJECT_NAME=${PROJECT_NAME}
+      AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}
+      REGION=${REGION}
+      ENVIRONMENT=${ENVIRONMENT}
+      VPC_CIDR=${VPC_CIDR}
+      TICKET=${TICKET:-N/A}
+      TEAM=${TEAM:-platform}
+      EOF
+  artifacts:
+    reports:
+      dotenv: provision.env
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+
+# ── Stage: init-project ───────────────────────────────────────────────────────
+
+Provision Init Project:
+  stage: init-project
+  needs:
+    - Provision Check Variables
+  script:
+    - |
+      echo "=== Provisioning new project: $PROJECT_NAME ==="
+
+      PROJECT_DIR="projects/${PROJECT_NAME}"
+
+      # Guard: do not overwrite an existing project
+      if [ -d "$PROJECT_DIR" ]; then
+        echo "ERROR: Project '$PROJECT_NAME' already exists at $PROJECT_DIR"
+        echo "To update an existing project, edit its project.yaml directly."
+        exit 1
+      fi
+
+      # Copy project-template
+      cp -r project-template/ "$PROJECT_DIR"
+
+      # Render project.yaml — substitute shell variables into the template
+      export PROJECT_NAME REGION ENVIRONMENT AWS_ACCOUNT_ID VPC_CIDR TICKET TEAM
+      envsubst < project-template/project.yaml > "$PROJECT_DIR/project.yaml"
+
+      echo ""
+      echo "=== Generated project.yaml ==="
+      cat "$PROJECT_DIR/project.yaml"
+
+      # Commit and push to main
+      git config user.email "ci-bot@gitlab.local"
+      git config user.name  "GitLab CI"
+      git add "$PROJECT_DIR"
+      git commit -m "Init new project: ${PROJECT_NAME}
+
+      Provisioned by pipeline $CI_PIPELINE_ID
+      Account : $AWS_ACCOUNT_ID
+      Region  : $REGION
+      Env     : $ENVIRONMENT
+      VPC CIDR: $VPC_CIDR"
+
+      git push "https://oauth2:${CI_BOT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" \
+        HEAD:main
+
+      echo ""
+      echo "Project $PROJECT_NAME created successfully."
+      echo "Next step: the deploy pipeline will pick up the new folder automatically"
+      echo "           on the next commit, or trigger it manually."
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success

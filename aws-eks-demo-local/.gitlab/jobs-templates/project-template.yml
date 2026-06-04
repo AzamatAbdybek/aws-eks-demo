@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Project Job Template
+#
+# Variables substituted at generation time by generate_jobs.py:
+#   ${PROJECT_FOLDER} — relative path to the project, e.g. projects/aws-eks-test1
+#   ${PROJECT_NAME}   — project identifier, e.g. aws-eks-test1
+# ─────────────────────────────────────────────────────────────────────────────
+
+"Terragrunt fmt ${PROJECT_FOLDER}":
+  extends: .terragrunt:fmt
+  variables:
+    PROJECT_FOLDER: "${PROJECT_FOLDER}"
+
+"Terragrunt Plan ${PROJECT_FOLDER}":
+  extends: .terragrunt:plan
+  needs:
+    - "Terragrunt fmt ${PROJECT_FOLDER}"
+  variables:
+    PROJECT_FOLDER: "${PROJECT_FOLDER}"
+
+"Terragrunt Apply ${PROJECT_FOLDER}":
+  extends: .terragrunt:apply
+  needs:
+    - "Terragrunt Plan ${PROJECT_FOLDER}"
+  variables:
+    PROJECT_FOLDER: "${PROJECT_FOLDER}"
+  rules:
+    # Apply requires manual approval on main; never runs on feature branches
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: manual
+    - when: never
+
+"Terragrunt Outputs ${PROJECT_FOLDER}":
+  extends: .terragrunt:outputs
+  needs:
+    - "Terragrunt Apply ${PROJECT_FOLDER}"
+  variables:
+    PROJECT_FOLDER: "${PROJECT_FOLDER}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: on_success
+    - when: never

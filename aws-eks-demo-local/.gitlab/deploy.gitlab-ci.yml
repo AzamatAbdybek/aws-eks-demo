@@ -1,0 +1,102 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Deploy Pipeline
+#
+# Flow:
+#   1. Detect Changed Projects  — diff HEAD~1 and list changed project folders
+#   2. Generate Terragrunt Jobs — Python script produces a child pipeline YAML
+#   3. Trigger Child Pipeline   — runs fmt → plan → apply (manual) → outputs
+#   4. Init New Project         — copies project-template for brand-new projects
+# ─────────────────────────────────────────────────────────────────────────────
+
+variables:
+  CHANGED_PROJECTS_FILE: "changed_projects.txt"
+
+# ── Stage: changes ────────────────────────────────────────────────────────────
+
+Detect Changed Projects:
+  stage: changes
+  script:
+    - |
+      echo "=== Detecting changed project folders ==="
+
+      # Collect all changed paths under projects/
+      git diff --name-only "${CI_COMMIT_BEFORE_SHA:-HEAD~1}" "$CI_COMMIT_SHA" \
+        | grep "^projects/" \
+        | awk -F'/' '{print $1"/"$2}' \
+        | sort -u \
+        | grep -vE "^projects/(aws-provider|common-vars|k8s-providers)" \
+        > "$CHANGED_PROJECTS_FILE" || true
+
+      if [ -s "$CHANGED_PROJECTS_FILE" ]; then
+        echo "Changed projects:"
+        cat "$CHANGED_PROJECTS_FILE"
+      else
+        echo "No project folders changed."
+      fi
+  artifacts:
+    paths:
+      - $CHANGED_PROJECTS_FILE
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web" && $EKS_UPGRADE == null && $EKS_ROLLBACK == null'
+
+# ── Stage: generate ───────────────────────────────────────────────────────────
+
+Generate Terragrunt Jobs:
+  stage: generate
+  needs:
+    - Detect Changed Projects
+  script:
+    - pip install pyyaml --quiet
+    - python3 .gitlab/generate_jobs.py
+    - |
+      echo "=== Generated pipeline preview ==="
+      cat .gitlab/generated-pipeline.gitlab-ci.yml || echo "(empty)"
+  artifacts:
+    paths:
+      - .gitlab/generated-pipeline.gitlab-ci.yml
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web" && $EKS_UPGRADE == null && $EKS_ROLLBACK == null'
+
+# ── Stage: trigger ────────────────────────────────────────────────────────────
+
+Trigger Terragrunt Pipeline:
+  stage: trigger
+  needs:
+    - Generate Terragrunt Jobs
+  trigger:
+    include:
+      - artifact: .gitlab/generated-pipeline.gitlab-ci.yml
+        job: Generate Terragrunt Jobs
+    strategy: depend
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web" && $EKS_UPGRADE == null && $EKS_ROLLBACK == null'
+
+# ── Stage: init-project ───────────────────────────────────────────────────────
+# Triggered automatically when a commit message contains "Init new project: <name>"
+
+Init New Project:
+  stage: init-project
+  script:
+    - |
+      # Extract project name from commit message
+      PROJECT_NAME=$(echo "$CI_COMMIT_MESSAGE" | grep -oP "(?<=Init new project: )\S+" || true)
+
+      if [ -z "$PROJECT_NAME" ]; then
+        echo "No 'Init new project:' marker in commit message — skipping"
+        exit 0
+      fi
+
+      PROJECT_DIR="projects/${PROJECT_NAME}"
+
+      if [ ! -d "$PROJECT_DIR" ]; then
+        echo "ERROR: expected $PROJECT_DIR to exist (should have been created by provision pipeline)"
+        exit 1
+      fi
+
+      echo "=== Initialising new project: $PROJECT_NAME ==="
+      echo "Project folder: $PROJECT_DIR"
+      ls -la "$PROJECT_DIR"
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /Init new project:/'

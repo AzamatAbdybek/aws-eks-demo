@@ -1,0 +1,281 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# EKS Upgrade Automation Pipeline
+#
+# Trigger via GitLab UI with:
+#   EKS_UPGRADE=true
+#   TARGET_PROJECT=aws-eks-test1        (required)
+#   TARGET_EKS_VERSION=1.36             (optional — auto-calculated if omitted)
+#
+# Rollback trigger:
+#   EKS_ROLLBACK=true
+#   TARGET_PROJECT=aws-eks-test1        (required)
+#   ROLLBACK_EKS_VERSION=1.35           (required)
+#
+# Pipeline stages:
+#   1. eks-discover  — detect current version, calculate next, verify AWS availability
+#   2. eks-validate  — run terragrunt plan with bumped version; revert on failure
+#   3. eks-create-mr — create upgrade branch + GitLab MR with pre-merge checklist
+#   4. eks-notify    — assign reviewers, post summary comment on MR
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Discover ─────────────────────────────────────────────────────────
+
+EKS Discover:
+  stage: eks-discover
+  rules:
+    - if: '$EKS_UPGRADE == "true" || $EKS_ROLLBACK == "true"'
+  script:
+    - |
+      : "${TARGET_PROJECT:?TARGET_PROJECT is required (e.g. aws-eks-test1)}"
+
+      PROJECT_FILE="projects/${TARGET_PROJECT}/project.yaml"
+
+      if [ ! -f "$PROJECT_FILE" ]; then
+        echo "ERROR: $PROJECT_FILE not found"
+        exit 1
+      fi
+
+      # Read current version from project.yaml
+      CURRENT_VERSION=$(grep 'eks_version' "$PROJECT_FILE" \
+        | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/' | tr -d ' ')
+
+      echo "Project       : $TARGET_PROJECT"
+      echo "Current version: $CURRENT_VERSION"
+
+      # Calculate next version (or use the pinned one)
+      if [ -n "$TARGET_EKS_VERSION" ]; then
+        NEXT_VERSION="$TARGET_EKS_VERSION"
+        echo "Target version : $NEXT_VERSION (pinned via TARGET_EKS_VERSION)"
+      else
+        MINOR=$(echo "$CURRENT_VERSION" | cut -d'.' -f2)
+        NEXT_MINOR=$((MINOR + 1))
+        NEXT_VERSION="1.${NEXT_MINOR}"
+        echo "Target version : $NEXT_VERSION (auto-calculated)"
+      fi
+
+      # Verify the target version is available in AWS
+      SUPPORTED=$(aws eks describe-addon-versions \
+        --kubernetes-version "$NEXT_VERSION" \
+        --query 'addons[0].addonVersions[0].addonVersion' \
+        --output text 2>/dev/null || echo "NOT_FOUND")
+
+      if [ "$SUPPORTED" = "None" ] || [ "$SUPPORTED" = "NOT_FOUND" ] || [ -z "$SUPPORTED" ]; then
+        echo "EKS $NEXT_VERSION is NOT yet available in AWS — skipping upgrade"
+        echo "UPGRADE_AVAILABLE=false" > upgrade.env
+      else
+        echo "EKS $NEXT_VERSION is available — proceeding"
+        {
+          echo "UPGRADE_AVAILABLE=true"
+          echo "CURRENT_VERSION=$CURRENT_VERSION"
+          echo "NEXT_VERSION=$NEXT_VERSION"
+          echo "TARGET_PROJECT=$TARGET_PROJECT"
+        } > upgrade.env
+      fi
+
+      cat upgrade.env
+  artifacts:
+    reports:
+      dotenv: upgrade.env
+
+# ── Stage 2: Validate ─────────────────────────────────────────────────────────
+
+EKS Validate Plan:
+  stage: eks-validate
+  rules:
+    - if: '$EKS_UPGRADE == "true"'
+  needs:
+    - EKS Discover
+  script:
+    - |
+      if [ "$UPGRADE_AVAILABLE" != "true" ]; then
+        echo "No upgrade available — skipping validation"
+        exit 0
+      fi
+
+      PROJECT_FILE="projects/${TARGET_PROJECT}/project.yaml"
+
+      echo "=== Temporarily bumping eks_version to $NEXT_VERSION in $PROJECT_FILE ==="
+      sed -i "s/eks_version\s*=\s*\"[^\"]*\"/eks_version            = \"${NEXT_VERSION}\"/" \
+        "$PROJECT_FILE"
+
+      echo "--- Running terragrunt plan ---"
+      cd "projects/${TARGET_PROJECT}/aws-eks-cluster"
+      terragrunt plan -detailed-exitcode
+      PLAN_EXIT=$?
+
+      # Revert the temporary version bump regardless of result
+      cd "$CI_PROJECT_DIR"
+      git checkout "$PROJECT_FILE"
+
+      # Exit code 2 = plan has changes (expected for an upgrade)
+      # Exit code 0 = no changes (may already be at target version)
+      # Any other code = error
+      if [ "$PLAN_EXIT" -eq 2 ] || [ "$PLAN_EXIT" -eq 0 ]; then
+        echo "Plan succeeded (exit $PLAN_EXIT) — safe to create MR"
+      else
+        echo "ERROR: terragrunt plan failed with exit code $PLAN_EXIT"
+        exit 1
+      fi
+
+# ── Stage 3: Create MR ────────────────────────────────────────────────────────
+
+EKS Create MR:
+  stage: eks-create-mr
+  rules:
+    - if: '$EKS_UPGRADE == "true"'
+  needs:
+    - EKS Validate Plan
+  script:
+    - |
+      if [ "$UPGRADE_AVAILABLE" != "true" ]; then
+        echo "No upgrade available — skipping MR creation"
+        exit 0
+      fi
+
+      BRANCH="eks-upgrade/${TARGET_PROJECT}-v${CURRENT_VERSION}-to-v${NEXT_VERSION}"
+      PROJECT_FILE="projects/${TARGET_PROJECT}/project.yaml"
+
+      git config user.email "ci-bot@gitlab.local"
+      git config user.name  "GitLab CI"
+      git checkout -b "$BRANCH"
+
+      # Bump version in project.yaml
+      sed -i "s/eks_version\s*=\s*\"[^\"]*\"/eks_version            = \"${NEXT_VERSION}\"/" \
+        "$PROJECT_FILE"
+
+      git add "$PROJECT_FILE"
+      git commit -m "eks: upgrade ${TARGET_PROJECT} from v${CURRENT_VERSION} to v${NEXT_VERSION}
+
+      ## What changed
+      - Bumped \`eks_version\` from \`${CURRENT_VERSION}\` to \`${NEXT_VERSION}\`
+        in \`${PROJECT_FILE}\`
+
+      ## Pre-merge checklist
+      - [ ] Reviewed EKS release notes for v${NEXT_VERSION}
+      - [ ] Checked EKS add-on compatibility (coredns, kube-proxy, vpc-cni)
+      - [ ] Verified Karpenter compatibility with new Kubernetes API version
+      - [ ] Notified application teams of the planned upgrade window
+      - [ ] Confirmed Velero backup is current
+
+      ## Post-merge
+      Merging to \`main\` will automatically trigger \`Terragrunt Apply\` (manual approval)
+      for \`${TARGET_PROJECT}/aws-eks-cluster\`.
+
+      Generated by pipeline $CI_PIPELINE_ID"
+
+      git push "https://oauth2:${EKS_UPGRADE_GIT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" \
+        "$BRANCH" \
+        -o merge_request.create \
+        -o "merge_request.title=EKS Upgrade: ${TARGET_PROJECT} v${CURRENT_VERSION} → v${NEXT_VERSION}" \
+        -o merge_request.target_branch=main \
+        -o merge_request.remove_source_branch
+
+# ── Stage 4: Notify ───────────────────────────────────────────────────────────
+
+EKS Notify:
+  stage: eks-notify
+  rules:
+    - if: '$EKS_UPGRADE == "true"'
+  needs:
+    - EKS Create MR
+  script:
+    - |
+      if [ "$UPGRADE_AVAILABLE" != "true" ]; then
+        echo "No upgrade — nothing to notify"
+        exit 0
+      fi
+
+      BRANCH="eks-upgrade/${TARGET_PROJECT}-v${CURRENT_VERSION}-to-v${NEXT_VERSION}"
+
+      # Find the MR IID created in the previous stage
+      MR_IID=$(curl -sf \
+        --header "PRIVATE-TOKEN: $EKS_UPGRADE_GIT_TOKEN" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests?source_branch=${BRANCH}" \
+        | python3 -c "import sys,json; data=json.load(sys.stdin); print(data[0]['iid'])" 2>/dev/null \
+        || echo "")
+
+      if [ -z "$MR_IID" ]; then
+        echo "WARNING: Could not find MR for branch $BRANCH — skipping reviewer assignment"
+        exit 0
+      fi
+
+      echo "Found MR IID: $MR_IID"
+
+      # Assign reviewers (MR_REVIEWERS is a comma-separated list of usernames)
+      if [ -n "$MR_REVIEWERS" ]; then
+        REVIEWER_IDS=""
+        for USERNAME in $(echo "$MR_REVIEWERS" | tr ',' ' '); do
+          USER_ID=$(curl -sf \
+            --header "PRIVATE-TOKEN: $EKS_UPGRADE_GIT_TOKEN" \
+            "${CI_API_V4_URL}/users?username=${USERNAME}" \
+            | python3 -c "import sys,json; u=json.load(sys.stdin); print(u[0]['id'])" 2>/dev/null \
+            || echo "")
+          if [ -n "$USER_ID" ]; then
+            REVIEWER_IDS="${REVIEWER_IDS}\"reviewer_ids[]=${USER_ID}&"
+          fi
+        done
+
+        curl -sf --request PUT \
+          --header "PRIVATE-TOKEN: $EKS_UPGRADE_GIT_TOKEN" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${MR_IID}?${REVIEWER_IDS}" \
+          > /dev/null || true
+        echo "Reviewers assigned: $MR_REVIEWERS"
+      fi
+
+      # Post a summary comment
+      COMMENT="## EKS Upgrade Ready for Review 🚀
+
+**Project:** \`${TARGET_PROJECT}\`
+**Version change:** \`v${CURRENT_VERSION}\` → \`v${NEXT_VERSION}\`
+
+Automated upgrade MR created by [pipeline ${CI_PIPELINE_ID}](${CI_PIPELINE_URL}).
+
+Please review the checklist in the MR description before merging."
+
+      curl -sf --request POST \
+        --header "PRIVATE-TOKEN: $EKS_UPGRADE_GIT_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{\"body\": $(echo "$COMMENT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${MR_IID}/notes" \
+        > /dev/null || true
+
+      echo "Notification posted to MR $MR_IID"
+
+# ── Rollback ──────────────────────────────────────────────────────────────────
+
+EKS Rollback:
+  stage: eks-create-mr
+  rules:
+    - if: '$EKS_ROLLBACK == "true"'
+  needs:
+    - EKS Discover
+  script:
+    - |
+      : "${TARGET_PROJECT:?TARGET_PROJECT is required}"
+      : "${ROLLBACK_EKS_VERSION:?ROLLBACK_EKS_VERSION is required}"
+
+      PROJECT_FILE="projects/${TARGET_PROJECT}/project.yaml"
+      CURRENT_VERSION=$(grep 'eks_version' "$PROJECT_FILE" \
+        | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/' | tr -d ' ')
+
+      echo "Rolling back $TARGET_PROJECT from v${CURRENT_VERSION} to v${ROLLBACK_EKS_VERSION}"
+
+      BRANCH="eks-rollback/${TARGET_PROJECT}-v${CURRENT_VERSION}-to-v${ROLLBACK_EKS_VERSION}"
+
+      git config user.email "ci-bot@gitlab.local"
+      git config user.name  "GitLab CI"
+      git checkout -b "$BRANCH"
+
+      sed -i "s/eks_version\s*=\s*\"[^\"]*\"/eks_version            = \"${ROLLBACK_EKS_VERSION}\"/" \
+        "$PROJECT_FILE"
+
+      git add "$PROJECT_FILE"
+      git commit -m "eks: ROLLBACK ${TARGET_PROJECT} from v${CURRENT_VERSION} to v${ROLLBACK_EKS_VERSION}
+
+      Rollback initiated manually via pipeline $CI_PIPELINE_ID"
+
+      git push "https://oauth2:${EKS_UPGRADE_GIT_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" \
+        "$BRANCH" \
+        -o merge_request.create \
+        -o "merge_request.title=EKS ROLLBACK: ${TARGET_PROJECT} v${CURRENT_VERSION} → v${ROLLBACK_EKS_VERSION}" \
+        -o merge_request.target_branch=main

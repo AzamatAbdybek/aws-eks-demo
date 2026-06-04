@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared pipeline rules
+# Referenced via `extends:` in generated project jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Only run in child pipelines (triggered from the parent)
+.rules:child_pipeline:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+
+# Apply runs on main branch only, requires manual approval
+.rules:apply_main_manual:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: manual
+    - when: never
+
+# Plan runs automatically on all branches
+.rules:plan_always:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: on_success
+    - when: never
+
+# Outputs only run after a successful apply on main
+.rules:outputs_after_apply:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: on_success
+    - when: never
